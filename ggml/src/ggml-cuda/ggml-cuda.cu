@@ -814,16 +814,18 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
-        // compare the backing physical devices: distinct virtual devices may share one physical GPU,
+// compare the backing physical devices: distinct virtual devices may share one physical GPU,
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
         if (src_physical == dst_physical) {
+            ggml_cuda_set_device(src_ctx->device);
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
+            ggml_cuda_set_device(src_ctx->device);
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
 #endif
         }
@@ -2451,6 +2453,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
