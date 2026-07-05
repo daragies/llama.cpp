@@ -15,6 +15,19 @@ using json = common_json;
 
 namespace autoparser {
 
+// Trim the framing whitespace off an analyzer-derived marker (e.g. Qwen3.6's
+// func_name_suffix ">\n" → ">"): models emit spaces instead of the template's
+// newlines under long agentic generations, so the parser should match the
+// marker's non-whitespace core and let space() elements absorb the actual
+// separators. Whitespace-ONLY markers are kept as-is — there the whitespace
+// itself is the marker (e.g. GLM's "\n" function-name terminator) and
+// trimming it away would leave the boundary unterminated.
+static std::string trim_marker(const std::string & marker) {
+    std::string t = trim_whitespace(marker);
+    return t.empty() ? marker : t;
+}
+
+
 parser_build_context::parser_build_context(common_chat_peg_builder & p, const generation_params & inputs) :
     p(p),
     inputs(inputs),
@@ -67,8 +80,11 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
     // Build grammar if tools are present
     bool has_tools =
         autoparser.tools.format.mode != tool_format::NONE && inputs.tools.is_array() && !inputs.tools.empty();
-    std::string trigger_marker = !autoparser.tools.format.section_start.empty() ? autoparser.tools.format.section_start :
-                                                                                  autoparser.tools.format.per_call_start;
+    // Trim marker whitespace: the analyzer-derived marker carries the
+    // template's framing newline (e.g. "<tool_call>\n"); a trigger that
+    // requires the newline misses space-separated model output.
+    std::string trigger_marker = trim_marker(!autoparser.tools.format.section_start.empty() ? autoparser.tools.format.section_start :
+                                                                                                  autoparser.tools.format.per_call_start);
 
     bool has_response_format = !inputs.json_schema.empty() && inputs.json_schema.is_object();
     bool include_grammar = has_response_format || (has_tools &&
@@ -241,7 +257,13 @@ common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p, 
                                                     const common_peg_parser & call_id_section, bool have_call_id,
                                                     const common_peg_parser & args,
                                                     std::optional<common_peg_parser> atomic_peek) const {
-    auto              open           = p.tool_open(function.name_prefix + p.tool_name(p.literal(name)) + function.name_suffix);
+    const std::string func_name_suffix = trim_marker(function.name_suffix);
+    const std::string func_close       = trim_marker(function.close);
+    // If trimming stripped whitespace off the suffix (e.g. DeepSeek's
+    // "\n```json\n" -> "```json"), absorb the separator with space(); keep the
+    // sequence strict when the marker is unchanged (e.g. GLM's bare "\n").
+    auto              name_sep       = func_name_suffix != function.name_suffix ? p.space() : p.eps();
+    auto              open           = p.tool_open(function.name_prefix + p.tool_name(p.literal(name)) + name_sep + func_name_suffix);
     bool              matched_atomic = false;
     common_peg_parser func_parser    = p.eps();
 
@@ -262,20 +284,18 @@ common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p, 
         func_parser = open + call_id_section + p.space() + args;
     }
 
-    if (!function.close.empty()) {
-        func_parser = func_parser + p.space() + p.tool_close(p.literal(function.close));
+    if (!func_close.empty()) {
+        func_parser = func_parser + p.space() + p.tool_close(p.literal(func_close));
     } else if (!format.per_call_end.empty()) {
         // When there's no func_close but there is a per_call_end marker, use peek() to ensure
         // we only emit tool_close when we can actually see the closing marker. This prevents
         // premature closing during partial parsing when we've seen e.g. "</" which could be
         // either "</tool_call>" (end) or "<arg_key>" prefix that failed to match.
-        // Laguna (v4): the model may emit whitespace between the last </arg_value> and
-        // </tool_call> even though the template renders them tight. Tolerate optional
-        // leading space in the close lookahead so the tool call still closes.
-        auto close_peek = arguments.tolerate_intertag_whitespace
-                              ? p.peek(p.space() + p.literal(format.per_call_end))
-                              : p.peek(p.literal(format.per_call_end));
-        func_parser = func_parser + p.tool_close(close_peek);
+// The peeked marker is trimmed, so consume the separator whitespace first
+        // (e.g. GLM's "</arg_value>\n</tool_call>", or the Laguna v4 model emitting
+        // a space between the last </arg_value> and </tool_call>) or the peek would
+        // fail on it.
+        func_parser = func_parser + p.space() + p.tool_close(p.peek(p.literal(trim_marker(format.per_call_end))));
     } else {
         func_parser = func_parser + p.tool_close(p.space());  // force this to process tool closing callbacks in mapper
     }
@@ -360,7 +380,18 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
     auto &       p           = ctx.p;
     const auto & inputs      = ctx.inputs;
 
-    auto until_suffix = p.rule("until-suffix", p.until(arguments.value_suffix));
+    // Trimmed markers: the analyzer derives these with the template's exact
+    // whitespace (Qwen3.6: arg_name_suffix ">\n", arg_value_suffix
+    // "</parameter>\n", per_call_start "<tool_call>\n"). Match the trimmed
+    // tag and let space() / the value-trimming mapper absorb the separator
+    // whitespace, so space-separated model output parses like newline-
+    // separated output.
+    const std::string arg_name_suffix  = trim_marker(arguments.name_suffix);
+    const std::string arg_value_suffix = trim_marker(arguments.value_suffix);
+    const std::string per_call_start_t = trim_marker(format.per_call_start);
+    const std::string per_call_end_t   = trim_marker(format.per_call_end);
+
+    auto until_suffix = p.rule("until-suffix", p.until(arg_value_suffix));
 
     common_peg_parser tool_choice = p.choice();
 
@@ -374,14 +405,16 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
         foreach_parameter(func, [&](const common_chat_schema_property & param, const common_chat_schema_document_ptr & doc) {
             auto arg =
                 p.tool_arg(p.tool_arg_open(arguments.name_prefix + p.tool_arg_name(p.literal(param.name)) +
-                                           arguments.name_suffix) +
-                           arguments.value_prefix +
+                                           arg_name_suffix) +
+                           // arg_name_suffix is trimmed, so absorb the separator whitespace
+                           // (e.g. GLM's "</arg_key>\n<arg_value>") explicitly.
+                           p.space() + trim_whitespace(arguments.value_prefix) +
                            (param.schema->may_be_string() ?
                                 p.ac(p.tool_arg_string_value(until_suffix) +
-                                    p.tool_arg_close(p.literal(arguments.value_suffix)), arguments.value_suffix) :
+                                    p.tool_arg_close(p.literal(arg_value_suffix)), arg_value_suffix) :
                                 (p.tool_arg_json_value(p.schema(
                                     p.json(), "tool-" + name + "-arg-" + param.name + "-schema", doc, *param.schema)) +
-                                    p.tool_arg_close(p.literal(arguments.value_suffix)))));
+                                    p.space() + p.tool_arg_close(p.literal(arg_value_suffix)))));
 
             auto named_arg = p.rule("tool-" + name + "-arg-" + param.name, arg);
             if (param.required) {
@@ -441,11 +474,16 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
 
     common_peg_parser tool_calls = p.eps();
 
-    if (!format.per_call_start.empty()) {
-        auto wrapped_call = format.per_call_start + p.space() + tool_choice + p.space() + format.per_call_end;
+    if (!per_call_start_t.empty()) {
         if (inputs.parallel_tool_calls) {
+            // Accept both parallel shapes models emit: repeated
+            // per-call-wrapped calls (the template's canonical form) AND
+            // multiple calls inside a single wrapper.
+            auto calls_seq    = tool_choice + p.zero_or_more(p.space() + tool_choice);
+            auto wrapped_call = per_call_start_t + p.space() + calls_seq + p.space() + per_call_end_t;
             tool_calls = p.trigger_rule("tool-call", wrapped_call + p.zero_or_more(p.space() + wrapped_call) + p.space());
         } else {
+            auto wrapped_call = per_call_start_t + p.space() + tool_choice + p.space() + per_call_end_t;
             tool_calls = p.trigger_rule("tool-call", wrapped_call + p.space());
         }
         if (!format.section_start.empty()) {
@@ -470,7 +508,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
         tool_calls = p.optional(tool_calls);
     }
 
-    std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
+    std::string trigger_marker       = !format.section_start.empty() ? format.section_start : per_call_start_t;
     auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
     return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
 }
