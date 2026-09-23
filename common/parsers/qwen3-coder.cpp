@@ -88,9 +88,21 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
 
         // Tool call parser
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
-            auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
+            // Trimmed marker: absorb the separator whitespace (the template bakes
+            // ">\n" / "\n</parameter>\n" with a newline, but Qwen3-Coder may emit a
+            // space or multiple spaces instead). Matching the trimmed core and
+            // letting space() / the mapper's trailing-whitespace trim absorb the
+            // separator makes space-separated output parse like newline-separated
+            // output, mirroring the generic tag-tagged builder.
+            const std::string arg_value_suffix = "</parameter>";
+
+            // Trimmed `</parameter>` plus an explicit space absorber: the template bakes
+            // "\n</parameter>\n", but matches are also emitted space-separated. The value
+            // rule already trimmed arg_value_suffix, and `permute` concatenates args with
+            // no separator, so the trailing whitespace must be absorbed here.
+            auto arg_close = p.tool_arg_close(p.literal(arg_value_suffix) + p.space());
             auto arg_string = p.rule("xml-arg-string",
-                p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
+                p.ac(p.tool_arg_string_value(p.until(arg_value_suffix)) + arg_close, arg_value_suffix));
 
             auto tool_choice = p.choice();
             foreach_function(inputs.tools, [&](const json & tool) {
@@ -103,13 +115,13 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                 foreach_parameter(function, [&](const common_chat_schema_property & param, const common_chat_schema_document_ptr & doc) {
                     auto rule_name = "tool-" + name + "-arg-" + param.name;
 
-                    auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param.name)) + ">\n");
+                    auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param.name)) + ">" + p.space());
 
                     auto types = param.schema->value_types();
 
                     auto arg_value = p.eps();
                     if (!types.has(common_chat_schema::TYPE_STRING)) {
-                        arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + arg_close;
+                        arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + p.space() + arg_close;
                     } else if (types.is_only(common_chat_schema::TYPE_STRING)) {
                         arg_value = arg_string;
                     } else {
@@ -131,7 +143,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                         if (types.has(common_chat_schema::TYPE_NULL)) {
                             json_value |= p.json_null();
                         }
-                        arg_value = p.gbnf(p.atomic(p.tool_arg_json_value(json_value) + arg_close) | arg_string, "xml-arg-string");
+                        arg_value = p.gbnf(p.atomic(p.tool_arg_json_value(json_value) + p.space() + arg_close) | arg_string, "xml-arg-string");
                     }
 
                     auto arg_rule = p.rule(rule_name, p.tool_arg(arg_open + arg_value));
@@ -146,21 +158,26 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                     args = args + p.zero_or_more(p.choice(optional_args));
                 }
 
-                auto func = p.tool(p.tool_open("<function=" + p.tool_name(p.literal(name)) + ">\n") +
-                                   p.tool_args(args) +
-                                   p.tool_close(p.literal("</function>\n")));
+                    // Trimmed `<function=` opener plus a space absorber: the separator
+                    // between `function>` and the first `<parameter=` is baked as "\n" but
+                    // may also be emitted as a space. Absorbing it here (matching the
+                    // generic tag-tagged builder) makes space-separated output parse like
+                    // newline-separated output.
+                    auto func = p.tool(p.tool_open("<function=" + p.tool_name(p.literal(name)) + ">" + p.space()) +
+                                       p.tool_args(args) +
+                                       p.tool_close(p.literal("</function>") + p.space()));
 
                 tool_choice |= p.rule("tool-" + name, func);
             });
 
             auto min_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
 
-            auto tool_call_body = tool_choice + "</tool_call>" + p.space();
-            auto tool_call      = p.rule("tool-call", "<tool_call>\n" + tool_call_body);
+            auto tool_call_body = tool_choice + p.space() + "</tool_call>" + p.space();
+            auto tool_call      = p.rule("tool-call", "<tool_call>" + p.space() + tool_call_body);
 
             // Qwen3-Coder models may occasionally omit the <tool_call> token.
             auto tool_call_first = is_qwen3_coder ?
-                p.rule("tool-call-first", p.optional(p.literal("<tool_call>\n")) + tool_call_body) :
+                p.rule("tool-call-first", p.optional(p.literal("<tool_call>") + p.space()) + tool_call_body) :
                 tool_call;
 
             auto calls      = inputs.parallel_tool_calls ? tool_call_first + p.zero_or_more(tool_call) : tool_call_first;
