@@ -414,7 +414,12 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
                 value_to_add          = "\"";
                 closing_quote_pending = true;
             }
-            value_to_add += escape_json_string_inner(value_content);
+            // The XML parameter format separates the value from the close tag with a
+            // newline (e.g. "<parameter=x>\nvalue\n</parameter>"); trim that trailing
+            // separator so string args do not carry a newline into the JSON arguments.
+            // Leading whitespace is left untouched (tool_arg_open's space() absorbs it),
+            // mirroring the tool id/name/args branches above.
+            value_to_add += escape_json_string_inner(std::string(trim_trailing_space(value_content)));
         } else if (!value_content.empty()) {
             // Pythonic scalars/containers -> JSON.
             value_to_add += normalize_container_value(value_content);

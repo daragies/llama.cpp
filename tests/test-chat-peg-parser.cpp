@@ -18,6 +18,7 @@ using json = common_json;
 static json create_tools();
 static void test_example_native(testing & t);
 static void test_example_qwen3_coder(testing & t);
+static void test_example_qwen3_coder_trailing_separator(testing & t);
 static void test_example_qwen3_non_coder(testing & t);
 static void test_command7_parser_compare(testing & t);
 static void test_prefix_tool_names(testing & t);
@@ -37,6 +38,7 @@ int main(int argc, char * argv[]) {
 
     t.test("native", test_example_native);
     t.test("qwen3 coder", test_example_qwen3_coder);
+    t.test("qwen3 coder trailing separator", test_example_qwen3_coder_trailing_separator);
     t.test("qwen3 non-coder", test_example_qwen3_non_coder);
     t.test("comparison", test_command7_parser_compare);
     t.test("prefix tool names", test_prefix_tool_names);
@@ -490,6 +492,59 @@ static void test_example_qwen3_coder(testing & t) {
 
             prev = msg;
         }
+    });
+}
+
+static void test_example_qwen3_coder_trailing_separator(testing & t) {
+    // Regression: the qwen3-coder grammar captures the string argument up to and
+    // including the newline before "</parameter>" (`p.until(arg_value_suffix)`), so
+    // the mapper must strip that trailing separator. Otherwise `filePath` arrives at
+    // the client as "ARCHITECTURE.md\n" and every path stat fails with ENOENT while
+    // the fuzzy suggester (which normalizes whitespace) proposes the identical path.
+    auto parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
+        auto content = p.rule("content", p.content(p.until("<tool_call>")));
+
+        auto arg_close  = p.tool_arg_close(p.literal("</parameter>") + p.space());
+        auto arg_string = p.rule("xml-arg-string",
+            p.ac(p.tool_arg_string_value(p.until("</parameter>")) + arg_close, "</parameter>"));
+        auto arg_open   = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal("filePath")) + ">" + p.space());
+        auto arg        = p.rule("tool-read-arg-filePath", p.tool_arg(arg_open + arg_string));
+
+        auto tool_rule = p.rule("tool-read",
+            p.tool_open("<function=" + p.tool_name(p.literal("read")) + ">" + p.space()) + arg +
+            p.tool_close("</function>" + p.space()));
+
+        std::vector<common_peg_parser> tool_parsers;
+        tool_parsers.push_back(tool_rule);
+        auto tool_call = p.trigger_rule("tool-call",
+            p.literal("<tool_call>") + p.space() + p.choice(tool_parsers) + p.literal("</tool_call>"));
+
+        return content + p.zero_or_more(p.space() + tool_call) + p.end();
+    });
+
+    auto parse_args = [&](const std::string & value) {
+        std::string input =
+            "<tool_call>\n<function=read>\n<parameter=filePath>\n" + value +
+            "\n</parameter>\n</function>\n</tool_call>";
+        common_peg_parse_context ctx(input, COMMON_PEG_PARSE_FLAG_NONE);
+        auto result = parser.parse(ctx);
+        if (!t.assert_equal("parse succeeds", false, result.fail())) {
+            return std::string();
+        }
+        common_chat_msg msg;
+        common_chat_peg_mapper mapper(msg);
+        mapper.from_ast(ctx.ast, result);
+        if (!t.assert_equal("one tool call", (size_t) 1, msg.tool_calls.size())) {
+            return std::string();
+        }
+        return msg.tool_calls[0].arguments;
+    };
+
+    t.test("trailing separator is trimmed from a path arg", [&](testing & t) {
+        t.assert_equal("filePath", std::string("{\"filePath\":\"ARCHITECTURE.md\"}"), parse_args("ARCHITECTURE.md"));
+    });
+    t.test("inner newlines of a multi-line value are preserved", [&](testing & t) {
+        t.assert_equal("filePath", std::string("{\"filePath\":\"line1\\nline2\"}"), parse_args("line1\nline2"));
     });
 }
 
